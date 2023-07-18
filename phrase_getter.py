@@ -4,6 +4,7 @@ import datetime as dt
 from yt_dlp import YoutubeDL
 import ffmpeg
 import json
+import vtt2text as v2t
 
 DEFAULT_BUFFER_LINES = 20 # amount of transcript lines before and after the phrase to keep in clip
 DEFAULT_OVERLAP_THRESHOLD = .3 # Between 0 and 1. 0 = Combine all overlapping clips; 1 = combine none
@@ -56,7 +57,7 @@ def get_subtitles(video_id, channel_name, data_dir=os.getcwd(), overwrite=False)
             ydl.download(video_url)
     except Exception as e:
         print("Could not get subtitles for video:")
-        print(e)
+        print(video_url)
 
 
 def get_all_subtitles(channel_name, data_dir=os.getcwd(), overwrite=False):
@@ -64,11 +65,30 @@ def get_all_subtitles(channel_name, data_dir=os.getcwd(), overwrite=False):
     with open(catalog_path) as f:
         catalog = json.load(f)
 
-    for entry in catalog['entries']:
-        if overwrite or not os.path.exists(f"{norm_pth(data_dir)}channel_name/{entry['id']}---{entry['title']}.en.vtt"):
-            get_subtitles(entry['id'], channel_name, data_dir, overwrite)
-        else:
-            print(f"Subtitles for {entry['id']}---{entry['title']} already exist.")
+    for playlist in catalog['entries']:
+        for entry in playlist['entries']:
+            if overwrite or not os.path.exists(f"{norm_pth(data_dir)}{channel_name}/transcripts/{entry['id']}---{entry['title']}.en.vtt"):
+                try:
+                    get_subtitles(entry['id'], channel_name, data_dir, overwrite)
+                except:
+                    print(f"Could not get subtitles for {entry}")
+            else:
+                print(f"Subtitles for {entry['id']}---{entry['title']} already exist.")
+
+def convert_all_subs_to_oneline(channel_name, data_dir = os.getcwd()):
+
+    input_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts/"
+    output_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_oneline/"
+
+    input_files = [f for f in os.listdir(input_dir) if f.endswith(".en.vtt")]
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    for f in input_files:
+        f_name = re.match(r'^(.*)\.en\.vtt$', f).group(1)
+        f_out = f_name + ".txt"
+        v2t.convert(input_dir + f, output_dir + f_out)
 
 
 def download_video(video_id, output_dir=os.getcwd(), overwrite=False):
@@ -167,6 +187,8 @@ def normalize_str(a_str):
 def make_clip(time_bounds, filename, phrase, channel_name, data_dir):
     video_id, title = filename.split("---")
 
+    print(filename)
+
     start_time = stamp_to_dt(time_bounds[0])
     end_time = stamp_to_dt(time_bounds[1])
     diff_seconds = (end_time-start_time).total_seconds()
@@ -182,19 +204,24 @@ def make_clip(time_bounds, filename, phrase, channel_name, data_dir):
         os.makedirs(full_videos_dir)
 
     matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(filename)]
+    print(matching_input_files)
     if len(matching_input_files) == 0:
         download_video(video_id, full_videos_dir)
         matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(filename)]
 
-    input_path = f"{full_videos_dir + matching_input_files[0]}"
+    print(matching_input_files)
+    if len(matching_input_files) > 0:
+        input_path = f"{full_videos_dir + matching_input_files[0]}"
 
-    process = (ffmpeg
-        .input(input_path, ss=time_bounds[0], t=diff_seconds)
-        .output(output_path, f='mp4', vcodec='libx264')
-        .overwrite_output()
-    )
+        process = (ffmpeg
+            .input(input_path, ss=time_bounds[0], t=diff_seconds)
+            .output(output_path, f='mp4', vcodec='libx264')
+            .overwrite_output()
+        )
 
-    process.run()
+        process.run()
+    else:
+        print("No matching input files!")
     #cmd_str = f"ffmpeg -ss {time_bounds[0]} -i \"{input_path}\" -c copy -t {diff_seconds} \"{output_path}\""
     #cmd_str = f"ffmpeg -ss {time_bounds[0]} -i \"{input_path}\" -vcodec libx264 -t {diff_seconds} \"{output_path}\""
     #os.system(cmd_str)
@@ -202,10 +229,15 @@ def make_clip(time_bounds, filename, phrase, channel_name, data_dir):
 
 if __name__ == '__main__':
     directory = "H:/clips/"
-    channel_name = "BretWeinsteinDarkHorse"
-    phrase = "lockdown"
-    buffer_lines = 45
+    #channel_name = "LexFridman"
+    #channel_name = "BretWeinsteinDarkHorse"
+    #channel_name = "Campbellteaching"
+    channel_name = "JordanPetersonVideos"
+
+
+    phrase = "hot dog"
+    buffer_lines = 10
 
     #get_catalog(channel_name, directory)
-    #get_all_subtitles(channel_name, directory)
+    #get_all_subtitles (channel_name, directory)
     clip_all_instances(phrase, channel_name, directory, buffer_lines)
