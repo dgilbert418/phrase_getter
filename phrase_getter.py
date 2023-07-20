@@ -4,10 +4,9 @@ import datetime as dt
 from yt_dlp import YoutubeDL
 import ffmpeg
 import json
-import vtt2text as v2t
+import vtt_tools as vtt
+import pandas as pd
 
-DEFAULT_BUFFER_LINES = 20 # amount of transcript lines before and after the phrase to keep in clip
-DEFAULT_OVERLAP_THRESHOLD = .3 # Between 0 and 1. 0 = Combine all overlapping clips; 1 = combine none
 DEFAULT_SLEEP_INTERVAL = 1.0 # for youtube-dl API calls
 
 def norm_pth(path):
@@ -15,6 +14,15 @@ def norm_pth(path):
         path += "/"
 
     return path
+
+def norm_txt(text):
+    # Remove non-alphanumeric characters using regex
+    normalized_text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+
+    # Convert the text to lowercase
+    normalized_text = normalized_text.lower()
+
+    return normalized_text
 
 
 def get_catalog(channel_name, data_dir=os.getcwd()):
@@ -75,10 +83,10 @@ def get_all_subtitles(channel_name, data_dir=os.getcwd(), overwrite=False):
             else:
                 print(f"Subtitles for {entry['id']}---{entry['title']} already exist.")
 
-def convert_all_subs_to_oneline(channel_name, data_dir = os.getcwd()):
 
+def convert_all_subs_to_tsv(channel_name, data_dir=os.getcwd()):
     input_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts/"
-    output_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_oneline/"
+    output_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"
 
     input_files = [f for f in os.listdir(input_dir) if f.endswith(".en.vtt")]
 
@@ -87,8 +95,8 @@ def convert_all_subs_to_oneline(channel_name, data_dir = os.getcwd()):
 
     for f in input_files:
         f_name = re.match(r'^(.*)\.en\.vtt$', f).group(1)
-        f_out = f_name + ".txt"
-        v2t.convert(input_dir + f, output_dir + f_out)
+        f_out = f_name + ".tsv"
+        vtt.convert_to_tsv(input_dir + f, output_dir + f_out)
 
 
 def download_video(video_id, output_dir=os.getcwd(), overwrite=False):
@@ -108,94 +116,134 @@ def download_video(video_id, output_dir=os.getcwd(), overwrite=False):
         ydl.download(video_url)
 
 
-def get_instances(filename, phrase, transcript_dir, buffer_lines=DEFAULT_BUFFER_LINES):
-    instances = []
-    if not transcript_dir[-1] == "/":
-        transcript_dir += "/"
+def get_instances(filename, phrase, transcript_dir):
+    phrase = norm_txt(phrase)
+    transcript_dir = norm_pth(transcript_dir)
 
     matching_files = [f for f in os.listdir(transcript_dir) if f.startswith(filename)]
     filename_with_ext = matching_files[0]
 
-    with open(transcript_dir + filename_with_ext, 'r', encoding='utf-8', errors="ignore") as f:
-        lines = f.readlines()
-    for i, line in enumerate(lines):
-        if phrase in line:
-            instances.append("  ".join(lines[max(0, i - buffer_lines): i + buffer_lines + 1]))
-    return instances
+    transcript = pd.read_csv(transcript_dir + filename_with_ext, sep="\t")
+
+    timestamps = []
+
+    phrase_words = phrase.split(" ")
+    for i in range(len(transcript)):
+        cur_phrase = ""
+        cur_line_u = i
+        cur_text = norm_txt(transcript.loc[i, "text"])
+        for j, word in enumerate(phrase_words):
+            if j > 0:
+                cur_phrase += " "
+            cur_phrase += word
+            if cur_phrase in cur_text:
+                if cur_phrase == phrase:
+                    timestamps.append(transcript.loc[i, "start"])
+                elif cur_text.endswith(cur_phrase):
+                    while cur_text.endswith(cur_phrase) and (cur_line_u < (len(transcript)-1)):
+                        cur_line_u += 1
+                        cur_text = cur_text + " " + norm_txt(transcript.loc[cur_line_u, "text"])
+            else:
+                break
+
+    return timestamps
 
 
-def get_time_bounds(instance):
-    time_format = "\d\d:\d\d:\d\d\.\d\d\d"
-    timestamps = re.findall(time_format, instance)
-    return timestamps[0], timestamps[-1]
+def make_manifest(phrase, channel_name, data_dir):
+    transcript_tsv_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"
+    manifest_dir = f"{norm_pth(data_dir)}{channel_name}/manifests/"
+
+    manifest = pd.DataFrame({
+        "video_id": [],
+        "title": [],
+        "phrase": [],
+        "timestamp": []
+    })
+    num_videos = 0
+
+    print(f"Making manifest for phrase \"{phrase}\"...")
+
+    for path in os.listdir(transcript_tsv_dir):
+        filename= path.replace(".tsv", "")
+        components = re.search(r'(.*)---(.*)', filename)
+        video_id = components.group(1)
+        title = components.group(2)
 
 
-def clip_all_instances(phrase, channel_name, data_dir, buffer_lines = DEFAULT_BUFFER_LINES, max_files=None):
-    file_count = 0
-    if not data_dir[-1] == "/":
-        data_dir += "/"
-    for path in os.listdir(f"{data_dir}{channel_name}/transcripts/"):
-        filename = path.replace(".en.vtt", "")
-        clip_all_instances_in_file(filename, phrase, channel_name, data_dir, buffer_lines)
-        file_count += 1
-        if max_files and file_count >= max_files:
-            break
+        instances = get_instances(filename, phrase, transcript_tsv_dir)
+        if len(instances) > 0:
+            num_videos += 1
+            for instance in instances:
+                manifest = manifest.append(
+                    pd.DataFrame([
+                        {
+                            "video_id": video_id,
+                            "title": title,
+                            "phrase": phrase,
+                            "timestamp": instance
+                        }
+                    ])
+                )
+
+            if not os.path.exists(manifest_dir):
+                os.makedirs(manifest_dir)
+
+    print(f"Found {len(manifest)} clips in {num_videos} videos.")
+    print(f"Writing manifest to " + manifest_dir + norm_txt(phrase) + ".csv")
+
+    manifest.to_csv(manifest_dir + norm_txt(phrase) + ".csv", header=True, index=False)
 
 
-def combine_overlapping_clips(time_bounds, overlap_threshold):
-    i = 0
-    while i < len(time_bounds) - 1:
-        l_outer = min(time_bounds[i][0], time_bounds[i + 1][0])
-        l_inner = max(time_bounds[i][0], time_bounds[i + 1][0])
-        r_inner = min(time_bounds[i][1], time_bounds[i + 1][1])
-        r_outer = max(time_bounds[i][1], time_bounds[i + 1][1])
+def clip_all(phrase, channel_name, data_dir, max_files=None, seconds_before=3, seconds_after=5, overwrite_manifest=False):
 
-        inner_seconds = (stamp_to_dt(r_inner) - stamp_to_dt(l_inner)).total_seconds()
-        outer_seconds = (stamp_to_dt(r_outer) - stamp_to_dt(l_outer)).total_seconds()
-        if inner_seconds / outer_seconds > overlap_threshold:
-            time_bounds[i] = (l_outer, r_outer)
-            del time_bounds[i + 1]
-        else:
-            i += 1
-    return time_bounds
+    manifest_path = f"{data_dir}{channel_name}/manifests/{norm_txt(phrase)}.csv"
+    if overwrite_manifest or (not os.path.exists(manifest_path)):
+        make_manifest(phrase, channel_name, data_dir)
 
+    manifest = pd.read_csv(manifest_path)
 
-def clip_all_instances_in_file(
-        filename, phrase, channel_name, data_dir,
-        buffer_lines=DEFAULT_BUFFER_LINES, overlap_threshold=DEFAULT_OVERLAP_THRESHOLD
-):
+    data_dir = norm_pth(data_dir)
 
-    transcript_dir = f"{data_dir}/{channel_name}/transcripts/"
-    instances = get_instances(filename, phrase, transcript_dir, buffer_lines)
-    time_bounds = [get_time_bounds(instance) for instance in instances]
-    time_bounds = combine_overlapping_clips(time_bounds, overlap_threshold)
+    if max_files and (max_files < len(manifest)):
+        num_clips = max_files
+    else:
+        num_clips = len(manifest)
 
-    for bound in time_bounds:
-        make_clip(bound, filename, phrase, channel_name, data_dir)
+    for i in range(num_clips):
+        try:
+            make_clip(
+                timestamp=manifest.loc[i, "timestamp"],
+                video_id=manifest.loc[i, "video_id"],
+                title=manifest.loc[i, "title"],
+                channel_name=channel_name,
+                data_dir=data_dir,
+                seconds_before=seconds_before,
+                seconds_after=seconds_after
+            )
+        except Exception as e:
+            print(f"Could not download manifest entry {i} (video_id {manifest.loc[i, 'video_id']}")
+            print(f"Exception: {str(e)}")
 
 
 def stamp_to_dt(stamp):
     return dt.datetime.strptime(stamp, "%H:%M:%S.%f")
 
-
-def normalize_str(a_str):
-    a_str = "".join([character for character in a_str if (character.isalnum() or character == " ")])
-    a_str = a_str.strip()
-    return a_str
+def dt_to_stamp(date):
+    return dt.datetime.strftime(date, "%H:%M:%S.%f")
 
 
-def make_clip(time_bounds, filename, phrase, channel_name, data_dir):
-    video_id, title = filename.split("---")
+def make_clip(timestamp, video_id, title, channel_name, data_dir, seconds_before=3, seconds_after=5):
 
-    print(filename)
+    timestamp_dt = stamp_to_dt(timestamp)
 
-    start_time = stamp_to_dt(time_bounds[0])
-    end_time = stamp_to_dt(time_bounds[1])
-    diff_seconds = (end_time-start_time).total_seconds()
+    start_dt = timestamp_dt - dt.timedelta(seconds=seconds_before)
+    end_dt = timestamp_dt + dt.timedelta(seconds=seconds_after)
+
+    diff_seconds = (end_dt - start_dt).total_seconds()
 
     full_videos_dir = f"{data_dir}{channel_name}/full_videos/"
-    phrase_dir = f"{data_dir}{channel_name}/clips/{normalize_str(phrase)}"
-    output_path = f"{phrase_dir}/{video_id}---{title}---{start_time.strftime('%H%M%S')}---{end_time.strftime('%H%M%S')}.mp4"
+    phrase_dir = f"{data_dir}{channel_name}/clips/{norm_txt(phrase)}"
+    output_path = f"{phrase_dir}/{video_id}---{title}---{start_dt.strftime('%H%M%S')}---{end_dt.strftime('%H%M%S')}.mp4"
 
     if not os.path.exists(phrase_dir):
         os.makedirs(phrase_dir)
@@ -203,18 +251,16 @@ def make_clip(time_bounds, filename, phrase, channel_name, data_dir):
     if not os.path.exists(full_videos_dir):
         os.makedirs(full_videos_dir)
 
-    matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(filename)]
-    print(matching_input_files)
+    matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(video_id)]
     if len(matching_input_files) == 0:
         download_video(video_id, full_videos_dir)
-        matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(filename)]
+        matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(video_id)]
 
-    print(matching_input_files)
     if len(matching_input_files) > 0:
         input_path = f"{full_videos_dir + matching_input_files[0]}"
 
         process = (ffmpeg
-            .input(input_path, ss=time_bounds[0], t=diff_seconds)
+            .input(input_path, ss=dt_to_stamp(start_dt), t=diff_seconds)
             .output(output_path, f='mp4', vcodec='libx264')
             .overwrite_output()
         )
@@ -222,22 +268,27 @@ def make_clip(time_bounds, filename, phrase, channel_name, data_dir):
         process.run()
     else:
         print("No matching input files!")
-    #cmd_str = f"ffmpeg -ss {time_bounds[0]} -i \"{input_path}\" -c copy -t {diff_seconds} \"{output_path}\""
-    #cmd_str = f"ffmpeg -ss {time_bounds[0]} -i \"{input_path}\" -vcodec libx264 -t {diff_seconds} \"{output_path}\""
-    #os.system(cmd_str)
 
 
 if __name__ == '__main__':
+
     directory = "H:/clips/"
+
+
     #channel_name = "LexFridman"
-    #channel_name = "BretWeinsteinDarkHorse"
+    channel_name = "BretWeinsteinDarkHorse"
     #channel_name = "Campbellteaching"
-    channel_name = "JordanPetersonVideos"
+    #channel_name = "JordanPetersonVideos"
+    #channel_name = "BenShapiro"
 
-
-    phrase = "hot dog"
-    buffer_lines = 10
+    phrase = "game theory"
 
     #get_catalog(channel_name, directory)
-    #get_all_subtitles (channel_name, directory)
-    clip_all_instances(phrase, channel_name, directory, buffer_lines)
+    #get_all_subtitles(channel_name, directory)
+    #convert_all_subs_to_tsv(channel_name, directory)
+
+    #make_manifest(phrase, channel_name, directory)
+    clip_all(phrase, channel_name, directory)
+
+
+
