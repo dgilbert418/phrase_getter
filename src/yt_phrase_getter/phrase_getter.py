@@ -363,27 +363,3 @@ if __name__ == '__main__':
         skip_manifest=args.skip_manifest,
         skip_download=args.skip_download
     )
-
-
-
-
-    #directory = "H:/clips/"
-
-
-    #channel_name = "LexFridman"
-    #channel_name = "BretWeinsteinDarkHorse"
-    #channel_name = "Campbellteaching"
-    #channel_name = "JordanPetersonVideos"
-    #channel_name = "BenShapiro"
-
-    #phrase = "game theoretic"
-
-    #get_catalog(channel_name, directory)
-    #get_all_subtitles(channel_name, directory)
-    #convert_all_subs_to_tsv(channel_name, directory)
-
-    #make_manifest(phrase, channel_name, directory)
-    #clip_all(phrase, channel_name, directory)
-
-    #print(get_video_release_date("Ocxl_Do1nx8"))
-
