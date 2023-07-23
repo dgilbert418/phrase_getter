@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import re
 import datetime as dt
@@ -6,6 +8,8 @@ import ffmpeg
 import json
 import vtt_tools as vtt
 import pandas as pd
+from pytube import YouTube
+import argparse
 
 DEFAULT_SLEEP_INTERVAL = 1.0 # for youtube-dl API calls
 
@@ -73,18 +77,25 @@ def get_all_subtitles(channel_name, data_dir=os.getcwd(), overwrite=False):
     with open(catalog_path) as f:
         catalog = json.load(f)
 
-    for playlist in catalog['entries']:
-        for entry in playlist['entries']:
-            if overwrite or not os.path.exists(f"{norm_pth(data_dir)}{channel_name}/transcripts/{entry['id']}---{entry['title']}.en.vtt"):
-                try:
-                    get_subtitles(entry['id'], channel_name, data_dir, overwrite)
-                except:
-                    print(f"Could not get subtitles for {entry}")
-            else:
-                print(f"Subtitles for {entry['id']}---{entry['title']} already exist.")
+    def _download_transcript(entry):
+        if overwrite or not os.path.exists(
+                f"{norm_pth(data_dir)}{channel_name}/transcripts/{entry['id']}---{entry['title']}.en.vtt"):
+            try:
+                get_subtitles(entry['id'], channel_name, data_dir, overwrite)
+            except:
+                print(f"Could not get subtitles for {entry}")
+        else:
+            print(f"Subtitles for {entry['id']}---{entry['title']} already exist.")
+
+    for tier_1_entry in catalog['entries']:
+        if tier_1_entry["_type"] == "playlist":
+            for tier_2_entry in tier_1_entry['entries']:
+                _download_transcript(tier_2_entry)
+        elif tier_1_entry["_type"] == "url":
+            _download_transcript(tier_1_entry)
 
 
-def convert_all_subs_to_tsv(channel_name, data_dir=os.getcwd()):
+def convert_all_subs_to_tsv(channel_name, data_dir=os.getcwd(), overwrite=False):
     input_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts/"
     output_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"
 
@@ -96,7 +107,8 @@ def convert_all_subs_to_tsv(channel_name, data_dir=os.getcwd()):
     for f in input_files:
         f_name = re.match(r'^(.*)\.en\.vtt$', f).group(1)
         f_out = f_name + ".tsv"
-        vtt.convert_to_tsv(input_dir + f, output_dir + f_out)
+        if overwrite or not os.path.exists(output_dir + f_out):
+            vtt.convert_to_tsv(input_dir + f, output_dir + f_out)
 
 
 def download_video(video_id, output_dir=os.getcwd(), overwrite=False):
@@ -149,49 +161,49 @@ def get_instances(filename, phrase, transcript_dir):
     return timestamps
 
 
-def make_manifest(phrase, channel_name, data_dir):
+def make_manifest(phrase, channel_name, data_dir, overwrite=False):
     transcript_tsv_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"
     manifest_dir = f"{norm_pth(data_dir)}{channel_name}/manifests/"
 
-    manifest = pd.DataFrame({
-        "video_id": [],
-        "title": [],
-        "phrase": [],
-        "timestamp": []
-    })
-    num_videos = 0
+    if overwrite or not os.path.exists(manifest_dir + norm_txt(phrase) + ".csv"):
+        manifest = pd.DataFrame({
+            "video_id": [],
+            "title": [],
+            "phrase": [],
+            "timestamp": []
+        })
+        num_videos = 0
 
-    print(f"Making manifest for phrase \"{phrase}\"...")
+        print(f"Making manifest for phrase \"{phrase}\"...")
 
-    for path in os.listdir(transcript_tsv_dir):
-        filename= path.replace(".tsv", "")
-        components = re.search(r'(.*)---(.*)', filename)
-        video_id = components.group(1)
-        title = components.group(2)
+        for path in os.listdir(transcript_tsv_dir):
+            filename= path.replace(".tsv", "")
+            components = re.search(r'(.*)---(.*)', filename)
+            video_id = components.group(1)
+            title = components.group(2)
 
+            instances = get_instances(filename, phrase, transcript_tsv_dir)
+            if len(instances) > 0:
+                num_videos += 1
+                for instance in instances:
+                    manifest = manifest.append(
+                        pd.DataFrame([
+                            {
+                                "video_id": video_id,
+                                "title": title,
+                                "phrase": phrase,
+                                "timestamp": instance
+                            }
+                        ])
+                    )
 
-        instances = get_instances(filename, phrase, transcript_tsv_dir)
-        if len(instances) > 0:
-            num_videos += 1
-            for instance in instances:
-                manifest = manifest.append(
-                    pd.DataFrame([
-                        {
-                            "video_id": video_id,
-                            "title": title,
-                            "phrase": phrase,
-                            "timestamp": instance
-                        }
-                    ])
-                )
+                if not os.path.exists(manifest_dir):
+                    os.makedirs(manifest_dir)
 
-            if not os.path.exists(manifest_dir):
-                os.makedirs(manifest_dir)
+        print(f"Found {len(manifest)} clips in {num_videos} videos.")
+        print(f"Writing manifest to " + manifest_dir + norm_txt(phrase) + ".csv")
 
-    print(f"Found {len(manifest)} clips in {num_videos} videos.")
-    print(f"Writing manifest to " + manifest_dir + norm_txt(phrase) + ".csv")
-
-    manifest.to_csv(manifest_dir + norm_txt(phrase) + ".csv", header=True, index=False)
+        manifest.to_csv(manifest_dir + norm_txt(phrase) + ".csv", header=True, index=False)
 
 
 def clip_all(phrase, channel_name, data_dir, max_files=None, seconds_before=3, seconds_after=5, overwrite_manifest=False):
@@ -212,6 +224,7 @@ def clip_all(phrase, channel_name, data_dir, max_files=None, seconds_before=3, s
     for i in range(num_clips):
         try:
             make_clip(
+                phrase=manifest.loc[i, "phrase"],
                 timestamp=manifest.loc[i, "timestamp"],
                 video_id=manifest.loc[i, "video_id"],
                 title=manifest.loc[i, "title"],
@@ -228,11 +241,12 @@ def clip_all(phrase, channel_name, data_dir, max_files=None, seconds_before=3, s
 def stamp_to_dt(stamp):
     return dt.datetime.strptime(stamp, "%H:%M:%S.%f")
 
+
 def dt_to_stamp(date):
     return dt.datetime.strftime(date, "%H:%M:%S.%f")
 
 
-def make_clip(timestamp, video_id, title, channel_name, data_dir, seconds_before=3, seconds_after=5):
+def make_clip(phrase, timestamp, video_id, title, channel_name, data_dir, seconds_before=3, seconds_after=5):
 
     timestamp_dt = stamp_to_dt(timestamp)
 
@@ -270,25 +284,106 @@ def make_clip(timestamp, video_id, title, channel_name, data_dir, seconds_before
         print("No matching input files!")
 
 
+def get_video_release_date(video_id):
+    url = f'https://www.youtube.com/watch?v={video_id}'
+    try:
+        yt = YouTube(url)
+        release_date = yt.publish_date
+        return release_date
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+def download_channel_subs(channel_name, data_dir=os.getcwd()):
+    get_catalog(channel_name, data_dir)
+    get_all_subtitles(channel_name, data_dir, overwrite=True)
+    convert_all_subs_to_tsv(channel_name, data_dir, overwrite=True)
+
+
+def get(phrase, channel_name, data_dir=os.getcwd(), max_files=None, seconds_before=3, seconds_after=5,
+        download_subs=False, skip_download=False, skip_manifest=False):
+
+    if download_subs or ((not skip_manifest) and (not os.path.exists(f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"))):
+        print("Transcripts do not exist. Downloading channel subs...")
+        download_channel_subs(channel_name, data_dir)
+
+    if skip_download:
+        make_manifest(phrase, data_dir, overwrite=True)
+    else:
+        clip_all(phrase, channel_name, data_dir, max_files=max_files, seconds_before=seconds_before,
+                 seconds_after=seconds_after, overwrite_manifest=(not skip_manifest))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Get clips of all instances of a phrase from a youtube channel's history."
+    )
+
+    parser.add_argument("phrase", type=str, help="Phrase to find clips of")
+    parser.add_argument("channel_name", type=str, help="Youtube channel name")
+    parser.add_argument(
+        "--output_directory", "-o", type=str, default=os.getcwd(),
+        help="Directory for outputting intermediate files, full downloaded videos and clips."
+             "If unspecified, uses current working directory."
+    )
+    parser.add_argument(
+        "--skip-download", action="store_true",
+        help="Use this flag to only output a table of instances without downloading videos."
+    )
+    parser.add_argument("--max-files", type=int, help="Caps the number of clips outputted. Good for common phrases.")
+    parser.add_argument("--seconds-before", type=int, default=3,
+                        help="Number of seconds before phrase instance to start each clip")
+    parser.add_argument("--seconds-after", type=int, default=5,
+                        help="Number of seconds after phrase instance to end each clip")
+    parser.add_argument(
+        "--skip-manifest", action="store_true",
+        help="Set to false to skip manifest creation step if manifest already exists for that phrase."
+    )
+    parser.add_argument(
+        "--download_subs", action="store_true",
+        help="Set to true to redownload all subtitles even if they already exist in the output directory."
+    )
+
+    args = parser.parse_args()
+    return args
+
+
 if __name__ == '__main__':
 
-    directory = "H:/clips/"
+    args = parse_args()
+
+    get(
+        phrase=args.phrase,
+        channel_name=args.channel_name,
+        data_dir=args.output_directory,
+        max_files=args.max_files,
+        seconds_before=args.seconds_before,
+        seconds_after=args.seconds_after,
+        download_subs=args.download_subs,
+        skip_manifest=args.skip_manifest,
+        skip_download=args.skip_download
+    )
+
+
+
+
+    #directory = "H:/clips/"
 
 
     #channel_name = "LexFridman"
-    channel_name = "BretWeinsteinDarkHorse"
+    #channel_name = "BretWeinsteinDarkHorse"
     #channel_name = "Campbellteaching"
     #channel_name = "JordanPetersonVideos"
     #channel_name = "BenShapiro"
 
-    phrase = "game theory"
+    #phrase = "game theoretic"
 
     #get_catalog(channel_name, directory)
     #get_all_subtitles(channel_name, directory)
     #convert_all_subs_to_tsv(channel_name, directory)
 
     #make_manifest(phrase, channel_name, directory)
-    clip_all(phrase, channel_name, directory)
+    #clip_all(phrase, channel_name, directory)
 
-
+    #print(get_video_release_date("Ocxl_Do1nx8"))
 
