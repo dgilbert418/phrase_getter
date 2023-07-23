@@ -74,4 +74,3 @@ if __name__ == '__main__':
         "H:/clips/BenShapiro/transcripts_tsv/_FF7nlWQuRU---Ben Shapiro Breaks Down the Kyle Rittenhouse Trial.tsv"
     )
 
-#def text_only(line):

@@ -3,7 +3,7 @@ requires = ["hatchling","ffmpeg","yt_dlp","pandas","pytube"]
 build-backend = "hatchling.build"
 
 [project]
-name = "yt_phrase_getter"
+name = "phrase_getter"
 version = "0.0.1"
 authors = [
   { name="Daniel Gilbert", email="dgilbert418@gmail.com" },
