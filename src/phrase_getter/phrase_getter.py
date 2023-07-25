@@ -2,22 +2,72 @@
 
 import os
 import re
+import argparse
+import json
 import datetime as dt
+
+import pandas as pd
 from yt_dlp import YoutubeDL
 import ffmpeg
-import json
-import vtt_tools as vtt
-import pandas as pd
 from pytube import YouTube
-import argparse
 
-DEFAULT_SLEEP_INTERVAL = 1.0 # for youtube-dl API calls
+import vtt_tools as vtt
+import visemes
+
+
+def stamp_to_dt(stamp):
+    return dt.datetime.strptime(stamp, "%H:%M:%S.%f")
+
+
+def dt_to_stamp(date):
+    return dt.datetime.strftime(date, "%H:%M:%S.%f")
+
+
+def make_config(args):
+    config = {key: value for key, value in vars(args).items()}
+
+    channel_root = f"{config['output_directory']}{config['channel_name']/}"
+
+    config["paths"] = {
+        "root": channel_root,
+        "catalog": channel_root + "catalog.json",
+        "clips": channel_root + "clips/" + norm_txt(config["phrase"] + "/"),
+        "full_videos": channel_root + "full_videos",
+        "manifest": channel_root + "manifests/" + norm_txt(config["phrase"]) + ".csv",
+        "manifest_root": channel_root + "manifests/",
+        "transcripts": {
+            "vtt": channel_root + "transcripts/vtt/",
+            "tsv": channel_root + "transcripts/tsv/",
+            "vis": channel_root + "transcripts/vis/"
+        }
+    }
+
+    if config["viseme_equivalent"]:
+        config["phrase_vis"] = visemes.txt_to_viseme(norm_txt(config["phrase"]))
+        config["paths"]["clips"] = channel_root + "clips/" + norm_txt(config["phrase"]) + "_vis/"
+        config["paths"]["manifest"] = channel_root + "manifests/" + norm_txt(config["phrase"]) + "_vis.csv"
+
+    config["overwrite"] = {
+        'manifest': False,
+        'vtt': False,
+        'tsv': False,
+        'vis': False,
+        'full_videos': False,
+    }
+
+    config["constants"] = {
+        "DEFAULT_SLEEP_INTERVAL": 1.0  # for youtube-dl API calls
+    }
+
+    return config
+
 
 def norm_pth(path):
     if not path[-1] == "/":
         path += "/"
 
     return path
+
 
 def norm_txt(text):
     # Remove non-alphanumeric characters using regex
@@ -29,14 +79,11 @@ def norm_txt(text):
     return normalized_text
 
 
-def get_catalog(channel_name, data_dir=os.getcwd()):
-    channel_url = "https://www.youtube.com/c/" + channel_name
-    output_dir = f"{norm_pth(data_dir)}/{channel_name}/"
+def get_catalog(config):
+    channel_url = "https://www.youtube.com/c/" + config["channel_name"]
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    output_file = f"{output_dir}catalog.json"
+    if not os.path.exists(config["paths"]["root"]):
+        os.makedirs(config["paths"]["root"])
 
     ydl_opts = {
         'skip_download': True,
@@ -45,24 +92,24 @@ def get_catalog(channel_name, data_dir=os.getcwd()):
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(channel_url)
 
-    with open(output_file, "w+") as f:
+    with open(config["paths"]["catalog"], "w+") as f:
         json.dump(info, f)
 
 
-def get_subtitles(video_id, channel_name, data_dir=os.getcwd(), overwrite=False):
+def get_subtitles(video_id, config):
     video_url = "https://www.youtube.com/watch?v=" + video_id
-    transcripts_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts/"
-    if not os.path.exists(transcripts_dir):
-        os.makedirs(transcripts_dir)
 
-    output_path = transcripts_dir + "%(id)s---%(title)s.%(ext)s"
+    if not os.path.exists(config["paths"]["transcripts"]["vtt"]):
+        os.makedirs(config["paths"]["transcripts"]["vtt"])
+
+    output_path = config["paths"]["transcripts"]["vtt"] + "%(id)s---%(title)s.%(ext)s"
 
     ydl_opts = {
         'skip_download': True,
         'writesubs': True,
         'writeautomaticsub': True,
         'outtmpl': output_path,
-        'overwrites': overwrite
+        'overwrites': config['overwrite']['vtt']
     }
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -72,16 +119,14 @@ def get_subtitles(video_id, channel_name, data_dir=os.getcwd(), overwrite=False)
         print(video_url)
 
 
-def get_all_subtitles(channel_name, data_dir=os.getcwd(), overwrite=False):
-    catalog_path = f"{norm_pth(data_dir)}{channel_name}/catalog.json"
-    with open(catalog_path) as f:
+def get_all_subtitles(config):
+    with open(config["paths"]["catalog"]) as f:
         catalog = json.load(f)
 
     def _download_transcript(entry):
-        if overwrite or not os.path.exists(
-                f"{norm_pth(data_dir)}{channel_name}/transcripts/{entry['id']}---{entry['title']}.en.vtt"):
+        if config['overwrite']['vtt'] or not os.path.exists(f"{config['paths']['vtt']}{entry['id']}---{entry['title']}.en.vtt"):
             try:
-                get_subtitles(entry['id'], channel_name, data_dir, overwrite)
+                get_subtitles(entry['id'], config)
             except:
                 print(f"Could not get subtitles for {entry}")
         else:
@@ -95,42 +140,42 @@ def get_all_subtitles(channel_name, data_dir=os.getcwd(), overwrite=False):
             _download_transcript(tier_1_entry)
 
 
-def convert_all_subs_to_tsv(channel_name, data_dir=os.getcwd(), overwrite=False):
-    input_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts/"
-    output_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"
+def convert_all_subs_to_tsv(config):
+    input_files = [f for f in os.listdir(config["paths"]["transcripts"]["vtt"]) if f.endswith(".en.vtt")]
 
-    input_files = [f for f in os.listdir(input_dir) if f.endswith(".en.vtt")]
-
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    if not os.path.exists(config["paths"]["transcripts"]["tsv"]):
+        os.makedirs(config["paths"]["transcripts"]["tsv"])
 
     for f in input_files:
         f_name = re.match(r'^(.*)\.en\.vtt$', f).group(1)
         f_out = f_name + ".tsv"
-        if overwrite or not os.path.exists(output_dir + f_out):
-            vtt.convert_to_tsv(input_dir + f, output_dir + f_out)
+        if config['overwrite']['tsv'] or not os.path.exists(config["paths"]["transcripts"]["tsv"] + f_out):
+            vtt.convert_to_tsv(config["paths"]["transcripts"]["vtt"] + f, config["paths"]["transcripts"]["tsv"] + f_out)
 
 
-def download_video(video_id, output_dir=os.getcwd(), overwrite=False):
+def download_video(video_id, config):
     video_url = "https://www.youtube.com/watch?v=" + video_id
-    output_dir = norm_pth(output_dir)
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    if not os.path.exists(config["paths"]["full_videos"]):
+        os.makedirs(config["paths"]["full_videos"])
 
-    output_path = output_dir + "%(id)s---%(title)s.%(ext)s"
+    output_path = config["paths"]["full_videos"] + "%(id)s---%(title)s.%(ext)s"
 
     ydl_opts = {
         'outtmpl': output_path,
-        'overwrites': overwrite
+        'overwrites': config['overwrite']['full_videos']
     }
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download(video_url)
 
 
-def get_instances(filename, phrase, transcript_dir):
-    phrase = norm_txt(phrase)
-    transcript_dir = norm_pth(transcript_dir)
+def get_instances(filename, config):
+    if config["viseme_equivalent"]:
+        transcript_dir = config["paths"]["transcripts"]["vis"]
+        phrase = config["phrase_vis"]
+    else:
+        transcript_dir = config["paths"]["transcripts"]["tsv"]
+        phrase = norm_txt(config["phrase"])
 
     matching_files = [f for f in os.listdir(transcript_dir) if f.startswith(filename)]
     filename_with_ext = matching_files[0]
@@ -161,11 +206,8 @@ def get_instances(filename, phrase, transcript_dir):
     return timestamps
 
 
-def make_manifest(phrase, channel_name, data_dir, overwrite=False):
-    transcript_tsv_dir = f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"
-    manifest_dir = f"{norm_pth(data_dir)}{channel_name}/manifests/"
-
-    if overwrite or not os.path.exists(manifest_dir + norm_txt(phrase) + ".csv"):
+def make_manifest(config):
+    if config['overwrite']['manifest'] or not os.path.exists(config["paths"]["manifest"]):
         manifest = pd.DataFrame({
             "video_id": [],
             "title": [],
@@ -174,15 +216,23 @@ def make_manifest(phrase, channel_name, data_dir, overwrite=False):
         })
         num_videos = 0
 
-        print(f"Making manifest for phrase \"{phrase}\"...")
+        if config["viseme_equivalent"]:
+            transcript_dir = config["paths"]["transcripts"]["vis"]
+            phrase = visemes.txt_to_viseme(norm_txt(config["phrase"]))
+        else:
+            transcript_dir = config["paths"]["transcripts"]["tsv"]
+            phrase = norm_txt(config["phrase"])
 
-        for path in os.listdir(transcript_tsv_dir):
+        print(f"Making manifest for phrase \"{config['phrase']}\"...")
+
+
+        for path in os.listdir(transcript_dir):
             filename= path.replace(".tsv", "")
             components = re.search(r'(.*)---(.*)', filename)
             video_id = components.group(1)
             title = components.group(2)
 
-            instances = get_instances(filename, phrase, transcript_tsv_dir)
+            instances = get_instances(filename, config)
             if len(instances) > 0:
                 num_videos += 1
                 for instance in instances:
@@ -197,81 +247,62 @@ def make_manifest(phrase, channel_name, data_dir, overwrite=False):
                         ])
                     )
 
-                if not os.path.exists(manifest_dir):
-                    os.makedirs(manifest_dir)
-
         print(f"Found {len(manifest)} clips in {num_videos} videos.")
-        print(f"Writing manifest to " + manifest_dir + norm_txt(phrase) + ".csv")
+        print(f"Writing manifest to " + config["paths"]["manifest"])
 
-        manifest.to_csv(manifest_dir + norm_txt(phrase) + ".csv", header=True, index=False)
+        if not os.path.exists(config["paths"]["manifest_root"]):
+            os.makedirs(config["paths"]["manifest_root"])
+        manifest.to_csv(config["paths"]["manifest"], header=True, index=False)
 
 
-def clip_all(phrase, channel_name, data_dir, max_files=None, seconds_before=3, seconds_after=5, overwrite_manifest=False):
+def clip_all(config):
+    if config["overwrites"]["manifest"] or (not os.path.exists(f"{config['paths']['manifests']}{config['phrase']}.csv")):
+        make_manifest(config)
 
-    manifest_path = f"{data_dir}{channel_name}/manifests/{norm_txt(phrase)}.csv"
-    if overwrite_manifest or (not os.path.exists(manifest_path)):
-        make_manifest(phrase, channel_name, data_dir)
+    manifest = pd.read_csv(config["paths"]["manifest"])
 
-    manifest = pd.read_csv(manifest_path)
-
-    data_dir = norm_pth(data_dir)
-
-    if max_files and (max_files < len(manifest)):
-        num_clips = max_files
+    if config["max_files"] and (config["max_files"] < len(manifest)):
+        num_clips = config["max_files"]
     else:
         num_clips = len(manifest)
 
     for i in range(num_clips):
         try:
             make_clip(
-                phrase=manifest.loc[i, "phrase"],
                 timestamp=manifest.loc[i, "timestamp"],
                 video_id=manifest.loc[i, "video_id"],
                 title=manifest.loc[i, "title"],
-                channel_name=channel_name,
-                data_dir=data_dir,
-                seconds_before=seconds_before,
-                seconds_after=seconds_after
+                config=config
             )
         except Exception as e:
             print(f"Could not download manifest entry {i} (video_id {manifest.loc[i, 'video_id']}")
             print(f"Exception: {str(e)}")
 
 
-def stamp_to_dt(stamp):
-    return dt.datetime.strptime(stamp, "%H:%M:%S.%f")
-
-
-def dt_to_stamp(date):
-    return dt.datetime.strftime(date, "%H:%M:%S.%f")
-
-
-def make_clip(phrase, timestamp, video_id, title, channel_name, data_dir, seconds_before=3, seconds_after=5):
+def make_clip(timestamp, video_id, title, config):
 
     timestamp_dt = stamp_to_dt(timestamp)
 
-    start_dt = timestamp_dt - dt.timedelta(seconds=seconds_before)
-    end_dt = timestamp_dt + dt.timedelta(seconds=seconds_after)
+    start_dt = timestamp_dt - dt.timedelta(seconds=config["seconds_before"])
+    end_dt = timestamp_dt + dt.timedelta(seconds=config["seconds_after"])
 
     diff_seconds = (end_dt - start_dt).total_seconds()
 
-    full_videos_dir = f"{data_dir}{channel_name}/full_videos/"
-    phrase_dir = f"{data_dir}{channel_name}/clips/{norm_txt(phrase)}"
-    output_path = f"{phrase_dir}/{video_id}---{title}---{start_dt.strftime('%H%M%S')}---{end_dt.strftime('%H%M%S')}.mp4"
+    output_path = f"{config['path']['clips']}/{video_id}---{title}---{start_dt.strftime('%H%M%S')}---{end_dt.strftime('%H%M%S')}.mp4"
 
-    if not os.path.exists(phrase_dir):
-        os.makedirs(phrase_dir)
+    if not os.path.exists(config['path']['clips']):
+        os.makedirs(config['path']['clips'])
 
-    if not os.path.exists(full_videos_dir):
-        os.makedirs(full_videos_dir)
+    if not os.path.exists(config['path']['full_videos']):
+        os.makedirs(config['path']['full_videos'])
 
-    matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(video_id)]
+    matching_input_files = [f for f in os.listdir(config['path']['full_videos']) if f.startswith(video_id)]
     if len(matching_input_files) == 0:
-        download_video(video_id, full_videos_dir)
-        matching_input_files = [f for f in os.listdir(full_videos_dir) if f.startswith(video_id)]
+        download_video(video_id, config['path']['full_videos'])
+        matching_input_files = [f for f in os.listdir(config['path']['full_videos']) if f.startswith(video_id)]
 
     if len(matching_input_files) > 0:
-        input_path = f"{full_videos_dir + matching_input_files[0]}"
+        input_path = f"{config['path']['full_videos'] + matching_input_files[0]}"
 
         process = (ffmpeg
             .input(input_path, ss=dt_to_stamp(start_dt), t=diff_seconds)
@@ -294,24 +325,57 @@ def get_video_release_date(video_id):
         print(f"Error: {e}")
         return None
 
-def download_channel_subs(channel_name, data_dir=os.getcwd()):
-    get_catalog(channel_name, data_dir)
-    get_all_subtitles(channel_name, data_dir, overwrite=True)
-    convert_all_subs_to_tsv(channel_name, data_dir, overwrite=True)
+
+def download_channel_subs(config):
+    get_catalog(config)
+    get_all_subtitles(config)
+    convert_all_subs_to_tsv(config)
 
 
-def get(phrase, channel_name, data_dir=os.getcwd(), max_files=None, seconds_before=3, seconds_after=5,
-        download_subs=False, skip_download=False, skip_manifest=False):
+def make_vis_tsvs(config):
+    input_files = [f for f in os.listdir(config['paths']['transcripts']['tsv']) if f.endswith(".tsv")]
 
-    if download_subs or ((not skip_manifest) and (not os.path.exists(f"{norm_pth(data_dir)}{channel_name}/transcripts_tsv/"))):
+    if not os.path.exists(config['paths']['transcripts']['vis']):
+        os.makedirs(config['paths']['transcripts']['vis'])
+
+    for f in input_files:
+        f_name = re.match(r'^(.*)\.tsv$', f).group(1)
+        f_out = f_name + ".tsv"
+        transcript = pd.read_csv(f, sep="\t")
+        transcript["text"] = transcript["text"].apply(visemes.txt_to_viseme)
+        transcript.to_csv(f_out, sep="\t", header=True, index=False)
+
+
+def run(config):
+    if config["download_subs"] or ((not config["skip_manifest"]) and (not os.path.exists(config["paths"]["transcripts"]["tsv"]))):
         print("Transcripts do not exist. Downloading channel subs...")
-        download_channel_subs(channel_name, data_dir)
+        download_channel_subs(config)
 
-    if skip_download:
-        make_manifest(phrase, data_dir, overwrite=True)
+    if config["viseme_equivalent"] and (not os.path.exists(config["paths"]["transcripts"]["vis"])):
+        make_vis_tsvs(config)
+
+    if config["skip_download"]:
+        make_manifest(config)
     else:
-        clip_all(phrase, channel_name, data_dir, max_files=max_files, seconds_before=seconds_before,
-                 seconds_after=seconds_after, overwrite_manifest=(not skip_manifest))
+        clip_all(config)
+
+def get(
+    phrase, channel_name, output_directory=os.getcwd(), skip_download=False, max_files=None,
+    seconds_before=3, seconds_after=5, skip_manifest=False, download_subs=False, viseme_equivalent=False
+):
+    args = {
+        'phrase': phrase,
+        'channel_name': channel_name,
+        'output_directory': output_directory,
+        'skip_download': skip_download,
+        'max_files': max_files,
+        'seconds_before': seconds_before,
+        'seconds_after': seconds_after,
+        'skip_manifest': skip_manifest,
+        'download_subs': download_subs,
+        'viseme_equivalent': viseme_equivalent
+    }
+    run(make_config(args))
 
 
 def parse_args():
@@ -337,11 +401,15 @@ def parse_args():
                         help="Number of seconds after phrase instance to end each clip")
     parser.add_argument(
         "--skip-manifest", action="store_true",
-        help="Set to false to skip manifest creation step if manifest already exists for that phrase."
+        help="Use this flag to skip manifest creation step if manifest already exists for that phrase."
     )
     parser.add_argument(
-        "--download_subs", action="store_true",
-        help="Set to true to redownload all subtitles even if they already exist in the output directory."
+        "--download-subs", action="store_true",
+        help="Use this flag to redownload all subtitles even if they already exist in the output directory."
+    )
+    parser.add_argument(
+        "--viseme-equivalent", action="store_true",
+        help="Use this flag to search for clips which are lip-reading equivalent to the provided phrase."
     )
 
     args = parser.parse_args()
@@ -351,15 +419,5 @@ def parse_args():
 if __name__ == '__main__':
 
     args = parse_args()
-
-    get(
-        phrase=args.phrase,
-        channel_name=args.channel_name,
-        data_dir=args.output_directory,
-        max_files=args.max_files,
-        seconds_before=args.seconds_before,
-        seconds_after=args.seconds_after,
-        download_subs=args.download_subs,
-        skip_manifest=args.skip_manifest,
-        skip_download=args.skip_download
-    )
+    config = make_config(args)
+    run(config)
