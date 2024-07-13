@@ -14,6 +14,9 @@ from pytube import YouTube
 import vtt_tools as vtt
 import visemes
 
+import traceback
+import sys
+
 
 def stamp_to_dt(stamp):
     return dt.datetime.strptime(stamp, "%H:%M:%S.%f")
@@ -26,13 +29,13 @@ def dt_to_stamp(date):
 def make_config(args):
     config = {key: value for key, value in vars(args).items()}
 
-    channel_root = f"{config['output_directory']}{config['channel_name']/}"
+    channel_root = f"{config['output_directory']}{config['channel_name']}/"
 
     config["paths"] = {
         "root": channel_root,
         "catalog": channel_root + "catalog.json",
         "clips": channel_root + "clips/" + norm_txt(config["phrase"] + "/"),
-        "full_videos": channel_root + "full_videos",
+        "full_videos": channel_root + "full_videos/",
         "manifest": channel_root + "manifests/" + norm_txt(config["phrase"]) + ".csv",
         "manifest_root": channel_root + "manifests/",
         "transcripts": {
@@ -48,7 +51,7 @@ def make_config(args):
         config["paths"]["manifest"] = channel_root + "manifests/" + norm_txt(config["phrase"]) + "_vis.csv"
 
     config["overwrite"] = {
-        'manifest': False,
+        'manifest': not config["skip_manifest"],
         'vtt': False,
         'tsv': False,
         'vis': False,
@@ -70,11 +73,15 @@ def norm_pth(path):
 
 
 def norm_txt(text):
+
     # Remove non-alphanumeric characters using regex
     normalized_text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
 
     # Convert the text to lowercase
     normalized_text = normalized_text.lower()
+
+    # strip
+    normalized_text = normalized_text.strip()
 
     return normalized_text
 
@@ -124,7 +131,7 @@ def get_all_subtitles(config):
         catalog = json.load(f)
 
     def _download_transcript(entry):
-        if config['overwrite']['vtt'] or not os.path.exists(f"{config['paths']['vtt']}{entry['id']}---{entry['title']}.en.vtt"):
+        if config['overwrite']['vtt'] or not os.path.exists(f"{config['paths']['transcripts']['vtt']}{entry['id']}---{entry['title']}.en.vtt"):
             try:
                 get_subtitles(entry['id'], config)
             except:
@@ -180,7 +187,10 @@ def get_instances(filename, config):
     matching_files = [f for f in os.listdir(transcript_dir) if f.startswith(filename)]
     filename_with_ext = matching_files[0]
 
-    transcript = pd.read_csv(transcript_dir + filename_with_ext, sep="\t")
+    transcript = pd.read_csv(
+        transcript_dir + filename_with_ext, sep="\t",
+        keep_default_na=False
+    )
 
     timestamps = []
 
@@ -188,7 +198,10 @@ def get_instances(filename, config):
     for i in range(len(transcript)):
         cur_phrase = ""
         cur_line_u = i
-        cur_text = norm_txt(transcript.loc[i, "text"])
+        cur_text = transcript.loc[i, "text"]
+        if not config["viseme_equivalent"]:
+            cur_text = norm_txt(cur_text)
+
         for j, word in enumerate(phrase_words):
             if j > 0:
                 cur_phrase += " "
@@ -199,7 +212,10 @@ def get_instances(filename, config):
                 elif cur_text.endswith(cur_phrase):
                     while cur_text.endswith(cur_phrase) and (cur_line_u < (len(transcript)-1)):
                         cur_line_u += 1
-                        cur_text = cur_text + " " + norm_txt(transcript.loc[cur_line_u, "text"])
+                        next_word = transcript.loc[cur_line_u, "text"]
+                        if not config["viseme_equivalent"]:
+                            next_word = norm_txt(next_word)
+                        cur_text = cur_text + " " + next_word
             else:
                 break
 
@@ -256,7 +272,7 @@ def make_manifest(config):
 
 
 def clip_all(config):
-    if config["overwrites"]["manifest"] or (not os.path.exists(f"{config['paths']['manifests']}{config['phrase']}.csv")):
+    if config["overwrite"]["manifest"] or (not os.path.exists(f"{config['paths']['manifest']}{config['phrase']}.csv")):
         make_manifest(config)
 
     manifest = pd.read_csv(config["paths"]["manifest"])
@@ -288,21 +304,21 @@ def make_clip(timestamp, video_id, title, config):
 
     diff_seconds = (end_dt - start_dt).total_seconds()
 
-    output_path = f"{config['path']['clips']}/{video_id}---{title}---{start_dt.strftime('%H%M%S')}---{end_dt.strftime('%H%M%S')}.mp4"
+    output_path = f"{config['paths']['clips']}/{video_id}---{title}---{start_dt.strftime('%H%M%S')}---{end_dt.strftime('%H%M%S')}.mp4"
 
-    if not os.path.exists(config['path']['clips']):
-        os.makedirs(config['path']['clips'])
+    if not os.path.exists(config['paths']['clips']):
+        os.makedirs(config['paths']['clips'])
 
-    if not os.path.exists(config['path']['full_videos']):
-        os.makedirs(config['path']['full_videos'])
+    if not os.path.exists(config['paths']['full_videos']):
+        os.makedirs(config['paths']['full_videos'])
 
-    matching_input_files = [f for f in os.listdir(config['path']['full_videos']) if f.startswith(video_id)]
+    matching_input_files = [f for f in os.listdir(config['paths']['full_videos']) if f.startswith(video_id)]
     if len(matching_input_files) == 0:
-        download_video(video_id, config['path']['full_videos'])
-        matching_input_files = [f for f in os.listdir(config['path']['full_videos']) if f.startswith(video_id)]
+        download_video(video_id, config)
+        matching_input_files = [f for f in os.listdir(config['paths']['full_videos']) if f.startswith(video_id)]
 
     if len(matching_input_files) > 0:
-        input_path = f"{config['path']['full_videos'] + matching_input_files[0]}"
+        input_path = f"{config['paths']['full_videos'] + matching_input_files[0]}"
 
         process = (ffmpeg
             .input(input_path, ss=dt_to_stamp(start_dt), t=diff_seconds)
@@ -341,9 +357,9 @@ def make_vis_tsvs(config):
     for f in input_files:
         f_name = re.match(r'^(.*)\.tsv$', f).group(1)
         f_out = f_name + ".tsv"
-        transcript = pd.read_csv(f, sep="\t")
+        transcript = pd.read_csv(config['paths']['transcripts']['tsv'] + f, sep="\t")
         transcript["text"] = transcript["text"].apply(visemes.txt_to_viseme)
-        transcript.to_csv(f_out, sep="\t", header=True, index=False)
+        transcript.to_csv(config['paths']['transcripts']['vis'] + f_out, sep="\t", header=True, index=False)
 
 
 def run(config):
@@ -361,7 +377,7 @@ def run(config):
 
 def get(
     phrase, channel_name, output_directory=os.getcwd(), skip_download=False, max_files=None,
-    seconds_before=3, seconds_after=5, skip_manifest=False, download_subs=False, viseme_equivalent=False
+    seconds_before=1, seconds_after=5, skip_manifest=False, download_subs=False, viseme_equivalent=False
 ):
     args = {
         'phrase': phrase,
@@ -395,7 +411,7 @@ def parse_args():
         help="Use this flag to only output a table of instances without downloading videos."
     )
     parser.add_argument("--max-files", type=int, help="Caps the number of clips outputted. Good for common phrases.")
-    parser.add_argument("--seconds-before", type=int, default=3,
+    parser.add_argument("--seconds-before", type=int, default=1,
                         help="Number of seconds before phrase instance to start each clip")
     parser.add_argument("--seconds-after", type=int, default=5,
                         help="Number of seconds after phrase instance to end each clip")
