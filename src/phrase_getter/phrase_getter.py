@@ -87,7 +87,9 @@ def norm_txt(text):
 
 
 def get_catalog(config):
+
     channel_url = "https://www.youtube.com/c/" + config["channel_name"]
+    alt_channel_url = "https://www.youtube.com/" + config["channel_name"]
 
     if not os.path.exists(config["paths"]["root"]):
         os.makedirs(config["paths"]["root"])
@@ -96,11 +98,17 @@ def get_catalog(config):
         'skip_download': True,
         'extract_flat': True
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(channel_url)
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(channel_url)
+    except:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(alt_channel_url)
 
     with open(config["paths"]["catalog"], "w+") as f:
         json.dump(info, f)
+
 
 
 def get_subtitles(video_id, config):
