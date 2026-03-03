@@ -260,7 +260,8 @@ def make_manifest(config):
             if len(instances) > 0:
                 num_videos += 1
                 for instance in instances:
-                    manifest = manifest.append(
+                    manifest = pd.concat([
+                        manifest,
                         pd.DataFrame([
                             {
                                 "video_id": video_id,
@@ -269,7 +270,7 @@ def make_manifest(config):
                                 "timestamp": instance
                             }
                         ])
-                    )
+                    ], ignore_index=True)
 
         print(f"Found {len(manifest)} clips in {num_videos} videos.")
         print(f"Writing manifest to " + config["paths"]["manifest"])
