@@ -10,12 +10,16 @@ import pandas as pd
 from yt_dlp import YoutubeDL
 import ffmpeg
 from pytube import YouTube
+import requests
+from dotenv import load_dotenv
 
 import vtt_tools as vtt
 import visemes
 
 import traceback
 import sys
+
+load_dotenv()
 
 
 def stamp_to_dt(stamp):
@@ -27,21 +31,26 @@ def dt_to_stamp(date):
 
 
 def make_config(args):
-    config = {key: value for key, value in vars(args).items()}
+    # Handle both argparse.Namespace and dict inputs
+    if isinstance(args, dict):
+        config = args.copy()
+    else:
+        config = {key: value for key, value in vars(args).items()}
 
     channel_root = f"{config['output_directory']}{config['channel_name']}/"
 
     config["paths"] = {
         "root": channel_root,
         "catalog": channel_root + "catalog.json",
+        "video_dates": channel_root + "video_dates.json",
         "clips": channel_root + "clips/" + norm_txt(config["phrase"] + "/"),
         "full_videos": channel_root + "full_videos/",
         "manifest": channel_root + "manifests/" + norm_txt(config["phrase"]) + ".csv",
         "manifest_root": channel_root + "manifests/",
         "transcripts": {
-            "vtt": channel_root + "transcripts/vtt/",
-            "tsv": channel_root + "transcripts/tsv/",
-            "vis": channel_root + "transcripts/vis/"
+            "vtt": channel_root + "transcripts/",
+            "tsv": channel_root + "transcripts_tsv/",
+            "vis": channel_root + "transcripts_vis/"
         }
     }
 
@@ -86,13 +95,142 @@ def norm_txt(text):
     return normalized_text
 
 
-def get_catalog(config):
+def get_existing_video_ids(config):
+    """Get video IDs from existing VTT transcript files."""
+    vtt_dir = config["paths"]["transcripts"]["vtt"]
+    if not os.path.exists(vtt_dir):
+        return set()
+    
+    existing_ids = set()
+    for filename in os.listdir(vtt_dir):
+        if filename.endswith(".en.vtt"):
+            # Extract video ID from filename format: {id}---{title}.en.vtt
+            # Video IDs are 11 chars but can contain - and _, so match up to ---
+            match = re.match(r'^(.+?)---', filename)
+            if match:
+                existing_ids.add(match.group(1))
+    return existing_ids
+
+
+def fetch_video_dates_batch(video_ids):
+    """
+    Fetch publish dates for multiple video IDs using YouTube Data API v3.
+    Returns dict mapping video_id -> publish_date (as ISO string).
+    """
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        print("Warning: YOUTUBE_API_KEY not found in environment. Cannot fetch video dates.")
+        return {}
+    
+    video_dates = {}
+    # YouTube API allows up to 50 IDs per request
+    batch_size = 50
+    
+    for i in range(0, len(video_ids), batch_size):
+        batch = video_ids[i:i + batch_size]
+        ids_str = ",".join(batch)
+        
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        params = {
+            "part": "snippet",
+            "id": ids_str,
+            "key": api_key
+        }
+        
+        try:
+            response = requests.get(url, params=params)
+            data = response.json()
+            
+            if response.status_code != 200:
+                error_msg = data.get("error", {}).get("message", "Unknown error")
+                print(f"YouTube API error ({response.status_code}): {error_msg}")
+                continue
+            
+            for item in data.get("items", []):
+                video_id = item["id"]
+                published_at = item["snippet"]["publishedAt"]
+                # Store as ISO string for JSON serialization
+                video_dates[video_id] = published_at
+                
+        except Exception as e:
+            print(f"Error fetching video dates for batch: {e}")
+    
+    return video_dates
+
+
+def load_video_dates_cache(config):
+    """Load cached video dates from file."""
+    if os.path.exists(config["paths"]["video_dates"]):
+        with open(config["paths"]["video_dates"]) as f:
+            return json.load(f)
+    return {}
+
+
+def save_video_dates_cache(config, video_dates):
+    """Save video dates to cache file."""
+    with open(config["paths"]["video_dates"], "w") as f:
+        json.dump(video_dates, f, indent=2)
+
+
+def get_video_dates(config, video_ids):
+    """
+    Get publish dates for video IDs, using cache when available.
+    Fetches missing dates from YouTube API and updates cache.
+    """
+    cached_dates = load_video_dates_cache(config)
+    
+    # Find IDs not in cache
+    missing_ids = [vid for vid in video_ids if vid not in cached_dates]
+    
+    if missing_ids:
+        print(f"Fetching dates for {len(missing_ids)} videos from YouTube API...")
+        new_dates = fetch_video_dates_batch(missing_ids)
+        cached_dates.update(new_dates)
+        save_video_dates_cache(config, cached_dates)
+        print(f"Cached {len(new_dates)} new video dates.")
+    
+    return cached_dates
+
+
+def parse_date_arg(date_str):
+    """Parse a date string in YYYY-MM-DD format to datetime."""
+    if date_str is None:
+        return None
+    return dt.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+
+
+def filter_videos_by_date(video_ids, video_dates, start_date, end_date):
+    """Filter video IDs by publish date range."""
+    filtered = []
+    for vid in video_ids:
+        if vid not in video_dates:
+            continue
+        
+        # Parse ISO date string
+        pub_date = dt.datetime.fromisoformat(video_dates[vid].replace("Z", "+00:00"))
+        
+        if start_date and pub_date < start_date:
+            continue
+        if end_date and pub_date > end_date:
+            continue
+        
+        filtered.append(vid)
+    
+    return filtered
+
+
+def get_catalog(config, force_refresh=False):
 
     channel_url = "https://www.youtube.com/c/" + config["channel_name"]
     alt_channel_url = "https://www.youtube.com/" + config["channel_name"]
 
     if not os.path.exists(config["paths"]["root"]):
         os.makedirs(config["paths"]["root"])
+
+    # Skip if catalog exists unless force refresh requested
+    if os.path.exists(config["paths"]["catalog"]) and not force_refresh:
+        print(f"Using existing catalog. Use --force-catalog to refresh.")
+        return
 
     ydl_opts = {
         'skip_download': True,
@@ -134,25 +272,37 @@ def get_subtitles(video_id, config):
         print(video_url)
 
 
-def get_all_subtitles(config):
+def get_all_subtitles(config, incremental=True):
     with open(config["paths"]["catalog"]) as f:
         catalog = json.load(f)
 
-    def _download_transcript(entry):
-        if config['overwrite']['vtt'] or not os.path.exists(f"{config['paths']['transcripts']['vtt']}{entry['id']}---{entry['title']}.en.vtt"):
-            try:
-                get_subtitles(entry['id'], config)
-            except:
-                print(f"Could not get subtitles for {entry}")
-        else:
-            print(f"Subtitles for {entry['id']}---{entry['title']} already exist.")
+    # Get existing video IDs for incremental mode
+    existing_ids = get_existing_video_ids(config) if incremental else set()
+    if incremental and existing_ids:
+        print(f"Found {len(existing_ids)} existing transcripts. Will only download new ones.")
 
+    # Collect all video entries from catalog
+    all_entries = []
     for tier_1_entry in catalog['entries']:
         if tier_1_entry["_type"] == "playlist":
             for tier_2_entry in tier_1_entry['entries']:
-                _download_transcript(tier_2_entry)
+                all_entries.append(tier_2_entry)
         elif tier_1_entry["_type"] == "url":
-            _download_transcript(tier_1_entry)
+            all_entries.append(tier_1_entry)
+
+    # Filter to only new videos if incremental
+    if incremental:
+        new_entries = [e for e in all_entries if e['id'] not in existing_ids]
+        print(f"Found {len(new_entries)} new videos to download transcripts for.")
+    else:
+        new_entries = all_entries
+
+    # Download transcripts for new entries
+    for entry in new_entries:
+        try:
+            get_subtitles(entry['id'], config)
+        except:
+            print(f"Could not get subtitles for {entry}")
 
 
 def convert_all_subs_to_tsv(config):
@@ -195,10 +345,16 @@ def get_instances(filename, config):
     matching_files = [f for f in os.listdir(transcript_dir) if f.startswith(filename)]
     filename_with_ext = matching_files[0]
 
-    transcript = pd.read_csv(
-        transcript_dir + filename_with_ext, sep="\t",
-        keep_default_na=False
-    )
+    try:
+        transcript = pd.read_csv(
+            transcript_dir + filename_with_ext, sep="\t",
+            keep_default_na=False,
+            on_bad_lines='skip',
+            quoting=3  # QUOTE_NONE - ignore quote characters
+        )
+    except Exception as e:
+        print(f"Warning: Could not parse {filename_with_ext}: {e}")
+        return []
 
     timestamps = []
 
@@ -236,7 +392,8 @@ def make_manifest(config):
             "video_id": [],
             "title": [],
             "phrase": [],
-            "timestamp": []
+            "timestamp": [],
+            "publish_date": []
         })
         num_videos = 0
 
@@ -249,16 +406,43 @@ def make_manifest(config):
 
         print(f"Making manifest for phrase \"{config['phrase']}\"...")
 
-
+        # Get all transcript files and extract video info
+        all_files = []
         for path in os.listdir(transcript_dir):
-            filename= path.replace(".tsv", "")
+            filename = path.replace(".tsv", "")
             components = re.search(r'(.*)---(.*)', filename)
-            video_id = components.group(1)
-            title = components.group(2)
+            if components:
+                all_files.append({
+                    'filename': filename,
+                    'video_id': components.group(1),
+                    'title': components.group(2)
+                })
+
+        # Apply date filtering if specified, or fetch dates for timestamp overlay
+        start_date = parse_date_arg(config.get("start_date"))
+        end_date = parse_date_arg(config.get("end_date"))
+        need_dates = start_date or end_date or config.get("timestamp_videos", False)
+        
+        if need_dates:
+            video_ids = [f['video_id'] for f in all_files]
+            video_dates = get_video_dates(config, video_ids)
+            
+            if start_date or end_date:
+                filtered_ids = set(filter_videos_by_date(video_ids, video_dates, start_date, end_date))
+                all_files = [f for f in all_files if f['video_id'] in filtered_ids]
+                print(f"After date filtering: {len(all_files)} videos in range.")
+        else:
+            video_dates = {}
+
+        for file_info in all_files:
+            filename = file_info['filename']
+            video_id = file_info['video_id']
+            title = file_info['title']
 
             instances = get_instances(filename, config)
             if len(instances) > 0:
                 num_videos += 1
+                pub_date = video_dates.get(video_id, "")
                 for instance in instances:
                     manifest = pd.concat([
                         manifest,
@@ -267,7 +451,8 @@ def make_manifest(config):
                                 "video_id": video_id,
                                 "title": title,
                                 "phrase": phrase,
-                                "timestamp": instance
+                                "timestamp": instance,
+                                "publish_date": pub_date
                             }
                         ])
                     ], ignore_index=True)
@@ -291,20 +476,39 @@ def clip_all(config):
     else:
         num_clips = len(manifest)
 
+    print(f"Creating {num_clips} clips...")
     for i in range(num_clips):
         try:
+            print(f"[{i+1}/{num_clips}] {manifest.loc[i, 'video_id']} - {manifest.loc[i, 'title'][:50]}...")
             make_clip(
                 timestamp=manifest.loc[i, "timestamp"],
                 video_id=manifest.loc[i, "video_id"],
                 title=manifest.loc[i, "title"],
+                publish_date=manifest.loc[i, "publish_date"] if "publish_date" in manifest.columns else None,
                 config=config
             )
         except Exception as e:
-            print(f"Could not download manifest entry {i} (video_id {manifest.loc[i, 'video_id']}")
+            print(f"Could not download manifest entry {i} (video_id {manifest.loc[i, 'video_id']})")
             print(f"Exception: {str(e)}")
 
 
-def make_clip(timestamp, video_id, title, config):
+def format_date_ordinal(date_str):
+    """Format date string to 'January 24th, 2026' format."""
+    if not date_str:
+        return None
+    try:
+        date = dt.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        day = date.day
+        if 11 <= day <= 13:
+            suffix = 'th'
+        else:
+            suffix = {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th')
+        return date.strftime(f"%B {day}{suffix}, %Y")
+    except:
+        return None
+
+
+def make_clip(timestamp, video_id, title, config, publish_date=None):
 
     timestamp_dt = stamp_to_dt(timestamp)
 
@@ -318,6 +522,10 @@ def make_clip(timestamp, video_id, title, config):
     if not os.path.exists(config['paths']['clips']):
         os.makedirs(config['paths']['clips'])
 
+    # Skip if clip already exists (unless force_clips is set)
+    if os.path.exists(output_path) and not config.get("force_clips", False):
+        return
+
     if not os.path.exists(config['paths']['full_videos']):
         os.makedirs(config['paths']['full_videos'])
 
@@ -329,13 +537,80 @@ def make_clip(timestamp, video_id, title, config):
     if len(matching_input_files) > 0:
         input_path = f"{config['paths']['full_videos'] + matching_input_files[0]}"
 
-        process = (ffmpeg
-            .input(input_path, ss=dt_to_stamp(start_dt), t=diff_seconds)
-            .output(output_path, f='mp4', vcodec='libx264')
-            .overwrite_output()
-        )
+        input_stream = ffmpeg.input(input_path, ss=dt_to_stamp(start_dt), t=diff_seconds)
+        
+        # Add timestamp overlay if requested
+        if config.get("timestamp_videos", False) and publish_date:
+            formatted_date = format_date_ordinal(publish_date)
+            if formatted_date:
+                # Build ffmpeg command directly for proper font handling on Windows
+                import subprocess
+                font_file = "C:/Windows/Fonts/pala.ttf"  # Palatino Linotype - elegant serif
+                drawtext_filter = (
+                    f"drawtext=text='{formatted_date}'"
+                    f":fontfile='{font_file}'"
+                    f":fontsize=156"
+                    f":fontcolor=white"
+                    f":borderw=4"
+                    f":bordercolor=black"
+                    f":shadowcolor=black@0.6"
+                    f":shadowx=4"
+                    f":shadowy=4"
+                    f":x=w-tw-50"
+                    f":y=40"
+                )
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-ss', dt_to_stamp(start_dt),
+                    '-i', input_path,
+                    '-t', str(diff_seconds),
+                    '-vf', drawtext_filter,
+                    '-c:v', 'libx264',
+                    '-c:a', 'aac',
+                    output_path
+                ]
+                result = subprocess.run(cmd, capture_output=True, timeout=int(diff_seconds) * 10 + 30)
+                if result.returncode != 0:
+                    stderr = result.stderr.decode() if result.stderr else ""
+                    if "Error parsing OBU data" in stderr or "Invalid data found" in stderr:
+                        print(f"Skipping clip due to corrupted video: {video_id}")
+                        if os.path.exists(output_path):
+                            os.remove(output_path)
+                return
+            else:
+                process = (input_stream
+                    .output(output_path, f='mp4', vcodec='libx264')
+                    .overwrite_output()
+                )
+        else:
+            process = (input_stream
+                .output(output_path, f='mp4', vcodec='libx264')
+                .overwrite_output()
+            )
 
-        process.run()
+        # Timeout: clip duration * 10 (for slow encodes) + 30 seconds buffer
+        timeout_seconds = int(diff_seconds) * 10 + 30
+        
+        try:
+            import subprocess
+            cmd = process.compile()
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                timeout=timeout_seconds
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode() if result.stderr else ""
+                if "Error parsing OBU data" in stderr or "Invalid data found" in stderr:
+                    print(f"Skipping clip due to corrupted video: {video_id}")
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    return
+        except subprocess.TimeoutExpired:
+            print(f"Timeout encoding clip from {video_id} - skipping (likely corrupted)")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return
     else:
         print("No matching input files!")
 
@@ -386,7 +661,8 @@ def run(config):
 
 def get(
     phrase, channel_name, output_directory=os.getcwd(), skip_download=False, max_files=None,
-    seconds_before=1, seconds_after=5, skip_manifest=False, download_subs=False, viseme_equivalent=False
+    seconds_before=1, seconds_after=5, skip_manifest=False, download_subs=False, viseme_equivalent=False,
+    start_date=None, end_date=None, force_clips=False, timestamp_videos=False
 ):
     args = {
         'phrase': phrase,
@@ -398,7 +674,11 @@ def get(
         'seconds_after': seconds_after,
         'skip_manifest': skip_manifest,
         'download_subs': download_subs,
-        'viseme_equivalent': viseme_equivalent
+        'viseme_equivalent': viseme_equivalent,
+        'start_date': start_date,
+        'end_date': end_date,
+        'force_clips': force_clips,
+        'timestamp_videos': timestamp_videos
     }
     run(make_config(args))
 
@@ -435,6 +715,22 @@ def parse_args():
     parser.add_argument(
         "--viseme-equivalent", action="store_true",
         help="Use this flag to search for clips which are lip-reading equivalent to the provided phrase."
+    )
+    parser.add_argument(
+        "--start-date", type=str, default=None,
+        help="Only include videos published on or after this date (format: YYYY-MM-DD)"
+    )
+    parser.add_argument(
+        "--end-date", type=str, default=None,
+        help="Only include videos published on or before this date (format: YYYY-MM-DD)"
+    )
+    parser.add_argument(
+        "--force-clips", action="store_true",
+        help="Force re-creation of clips even if they already exist."
+    )
+    parser.add_argument(
+        "--timestamp-videos", action="store_true",
+        help="Add publish date overlay (e.g., 'January 24th, 2026') to top-right of clips."
     )
 
     args = parser.parse_args()

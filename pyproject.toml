@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling","ffmpeg","yt_dlp","pandas","pytube"]
+requires = ["hatchling","ffmpeg","yt_dlp","pandas","pytube","requests","python-dotenv"]
 build-backend = "hatchling.build"
 
 [project]
